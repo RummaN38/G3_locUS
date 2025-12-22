@@ -20,7 +20,7 @@ You can download the checkpoints and retrieval index from [Jia-py/G3-checkpoint]
 # test on cuda12.0
 conda create -n g3 python=3.9
 pip install torch==2.1.1 torchvision==0.16.1 torchaudio==2.1.1 --index-url https://download.pytorch.org/whl/cu121
-pip install transformers accelerate huggingface_hub pandas
+pip install transformers==4.42.0 accelerate huggingface_hub pandas pyproj
 ```
 
 If there are any issues with transformers, you may try `transformers==4.42.0`.
