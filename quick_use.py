@@ -1,14 +1,18 @@
+from pathlib import Path
+
 import torch
 import numpy as np
 from PIL import Image
 from utils.G3 import G3
 
-image_path = 'xxx'
+_ROOT = Path(__file__).resolve().parent
+
+image_path = 'example.jpg'
 gps_data = [[10,20],[0,0]] # [[latitude1, longitude1],[latitude2, longitude2]]
-device = 'cuda'
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 model = G3(device).to(device)
-model.load_state_dict(torch.load('/checkpoints/g3.pth'))
+model.load_state_dict(torch.load(_ROOT / 'checkpoints' / 'g3.pth', map_location=device))
 image = Image.open(image_path).convert('RGB')
 image = model.vision_processor(images=image, return_tensors='pt')['pixel_values'].reshape(3,224,224)
 
