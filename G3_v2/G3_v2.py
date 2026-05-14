@@ -2,16 +2,11 @@ import torch
 import torch.nn as nn
 import numpy as np
 import pandas as pd
-import itertools
 from transformers import CLIPTokenizer, CLIPImageProcessor, CLIPModel
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-from .rff.layers import GaussianEncoding
-
 from pyproj import Proj, Transformer
 
-_CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
-_CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+from .rff.layers import GaussianEncoding
 
 class LocationEncoderCapsule(nn.Module):
     def __init__(self, sigma):
@@ -98,10 +93,13 @@ class G3(torch.nn.Module):
             num_layers=1,
         )
 
-        m = torch.tensor(_CLIP_MEAN, dtype=torch.float32).view(1, 1, 3, 1, 1)
-        s = torch.tensor(_CLIP_STD, dtype=torch.float32).view(1, 1, 3, 1, 1)
-        self.register_buffer("_clip_norm_mean", m)
-        self.register_buffer("_clip_norm_std", s)
+        # _CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+        # _CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+        # m = torch.tensor(_CLIP_MEAN, dtype=torch.float32).view(1, 1, 3, 1, 1)
+        # s = torch.tensor(_CLIP_STD, dtype=torch.float32).view(1, 1, 3, 1, 1)
+        # self.register_buffer("_clip_norm_mean", m)
+        # self.register_buffer("_clip_norm_std", s)
 
         # freeze CLIP
         self.vision_model.requires_grad_(False)
@@ -109,37 +107,13 @@ class G3(torch.nn.Module):
         self.text_model.requires_grad_(False)
         self.text_projection.requires_grad_(False)
 
-    def _vision_pooler(self, pixel_values_bt):
-        """pixel_values_bt: [N, 3, H, W] in the same value range as HF CLIP vision_model expects."""
-        out = self.vision_model(pixel_values=pixel_values_bt)
-        return out.pooler_output
+    def _encode_video(self, video, video_mask=None):
+        # apply CLIP mean/std -- already done in the RawVideoExtractor
+        # x = video.float()
+        # mean = self._clip_norm_mean.to(dtype=x.dtype, device=x.device)
+        # std = self._clip_norm_std.to(dtype=x.dtype, device=x.device)
+        # video = (x - mean) / std
 
-    def _maybe_apply_clip_normalize(self, video, apply_clip_normalization):
-        """If True, treat video as linear RGB in [0, 1] (e.g. after ToTensor) and apply CLIP mean/std."""
-        if not apply_clip_normalization:
-            return video
-        x = video.float()
-        if x.shape[-1] <= 4 or x.shape[-2] <= 4:
-            raise ValueError("Expected video shape [B, T, 3, H, W] with H, W > 4 for normalization.")
-        mean = self._clip_norm_mean.to(dtype=x.dtype, device=x.device)
-        std = self._clip_norm_std.to(dtype=x.dtype, device=x.device)
-        return (x - mean) / std
-
-    def _encode_video_to_clip_space(self, video, video_mask=None, apply_clip_normalization=False):
-        """
-        Encode a clip with frozen CLIP ViT (per frame) + trainable LSTM + masked mean over LSTM outputs.
-
-        No residual to original frame embeddings: the clip vector is only from temporal LSTM states.
-
-        video: [B, T, 3, H, W] — if apply_clip_normalization=True, values in [0, 1] per channel
-               (resize/center-crop to model size outside this module, e.g. via CLIPImageProcessor);
-               if False, pass tensors exactly as HF CLIP vision_model expects (processor output).
-        video_mask: optional [B, T] with 1 for valid frames, 0 for padding.
-        Returns:
-            video_embeds: [B, projection_dim] — mean of per-timestep LSTM outputs on valid frames
-            vision_pooled_mean: [B, vision_hidden] mean of pooler outputs (for debugging / returns)
-        """
-        video = self._maybe_apply_clip_normalize(video, apply_clip_normalization)
         if video.dim() == 4:
             video = video.unsqueeze(1)
         if video.dim() != 5:
@@ -153,54 +127,43 @@ class G3(torch.nn.Module):
             if video_mask.shape != (b, t):
                 raise ValueError(f"video_mask must be [B, T] = [{b}, {t}]")
 
-        flat = video.reshape(b * t, c, h, w)
-        pooler_flat = self._vision_pooler(flat)
-        vision_seq = pooler_flat.reshape(b, t, -1)
-        frame_embeds = self.vision_projection(pooler_flat).reshape(b, t, -1)
+        flat = video.reshape(b * t, c, h, w) # [B * T, 3, H, W]
+        pooler_flat = self.vision_model(pixel_values=flat) # [B * T, 768]
+        vision_seq = pooler_flat.reshape(b, t, -1) # [B, T, 768]
+        frame_embeds = self.vision_projection(pooler_flat).reshape(b, t, -1) # [B, T, 768]
 
         lengths = video_mask.sum(dim=1).to(torch.long).cpu()
-        if (lengths == 0).any():
-            raise ValueError("video_mask must have at least one valid frame per batch row.")
 
-        packed = pack_padded_sequence(frame_embeds, lengths, batch_first=True, enforce_sorted=False)
-        lstm_out, _ = self.lstm_visual(packed)
+        packed = pack_padded_sequence(frame_embeds, lengths, batch_first=True, enforce_sorted=False) # [sum_i lengths[i], proj_dim]
+        lstm_out, _ = self.lstm_visual(packed) # [sum_i lengths[i], proj_dim]
         if self.training:
             self.lstm_visual.flatten_parameters()
-        lstm_out, _ = pad_packed_sequence(lstm_out, batch_first=True, total_length=t)
+        lstm_out, _ = pad_packed_sequence(lstm_out, batch_first=True, total_length=t) # [B, T, proj_dim]
         mask_f = video_mask.to(dtype=lstm_out.dtype).unsqueeze(-1)
         denom = mask_f.sum(dim=1).clamp(min=1.0)
-        video_embeds = (lstm_out * mask_f).sum(dim=1) / denom
+        video_embeds = (lstm_out * mask_f).sum(dim=1) / denom # [B, proj_dim] - average of valid frames of LSTM embeddings
 
         mask_v = video_mask.to(dtype=vision_seq.dtype).unsqueeze(-1)
-        vision_pooled_mean = (vision_seq * mask_v).sum(dim=1) / mask_v.sum(dim=1).clamp(min=1.0)
+        vision_pooled_mean = (vision_seq * mask_v).sum(dim=1) / mask_v.sum(dim=1).clamp(min=1.0) # [B, 768] - average of valid frames of CLIP embeddings
 
         return video_embeds, vision_pooled_mean
 
     def forward(
         self,
-        video,
+        video, # [B, T, 3, H, W] - B - batch size, T - number of frames, 3 - channels, H - height, W - width
         texts,
         longitude,
         latitude,
         return_loss=True,
-        video_mask=None,
-        apply_clip_normalization=False,
+        video_mask=None
     ):
-        """
-        video: [B, 3, H, W] (single frame) or clip [B, T, 3, H, W].
-        Contrastive phases use one embedding per clip: masked mean of LSTM outputs (no residual to CLIP frame vectors).
-        video_mask: [B, T] when sequences are padded.
-        apply_clip_normalization: if True, apply CLIP mean/std (for [0,1] RGB after resize/crop).
-        """
-        video_embeds, vision_pooled_mean = self._encode_video_to_clip_space(
-            video, video_mask=video_mask, apply_clip_normalization=apply_clip_normalization
-        )
+        video_embeds, vision_pooled_mean = self._encode_video(video, video_mask)
         text_output = self.text_model(**texts)[1]
         text_embeds = self.text_projection(text_output) # batch_size, 512
         this_batch_locations = torch.stack((latitude, longitude), dim=1)
         location_embeds = self.location_encoder(this_batch_locations)
 
-        # phase _1 — text ↔ video (clip-level)
+        # phase _1 - text with video
         video_embeds_1 = self.vision_projection_else_1(video_embeds)
         text_embeds_1 = self.text_projection_else(text_embeds.reshape(text_embeds.shape[0], -1))
         
@@ -217,7 +180,7 @@ class G3(torch.nn.Module):
         if return_loss:
             loss_phase_1 = loss1
 
-        # phase _2 — location ↔ video (clip-level)
+        # phase _2 - location with video
         video_embeds_2 = self.vision_projection_else_2(video_embeds)
         location_embeds_2 = self.location_projection_else(location_embeds.reshape(location_embeds.shape[0], -1))
 

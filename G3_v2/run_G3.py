@@ -1,15 +1,15 @@
 import torch
-import os
-import numpy as np
-import time
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-from utils.utils import MP16Dataset
-from utils.G3 import G3
 from accelerate import Accelerator, DistributedDataParallelKwargs
 import warnings
 
+from .G3_v2 import G3
+from .sekai_dataset import SEKAI_Real_Walking_Dataset
+
+
 warnings.filterwarnings('ignore')
+
 
 def train_1epoch(dataloader, eval_dataloader, earlystopper, model, vision_processor, text_processor, optimizer, scheduler, device, accelerator=None):
     model.train()
@@ -39,14 +39,12 @@ def main():
 
     # fine-tune
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # device = 'cpu'
     model = G3(device).to(device)
     location_encoder_dict = torch.load('location_encoder.pth') # from geoclip
     model.location_encoder.load_state_dict(location_encoder_dict)
 
-    dataset = MP16Dataset(vision_processor = model.vision_processor, text_processor = model.text_processor)
+    dataset = SEKAI_Real_Walking_Dataset() # !!!
     dataloader = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=16, pin_memory=True, prefetch_factor=5)
-
 
     params = []
     for name, param in model.named_parameters():
