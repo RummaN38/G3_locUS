@@ -1,7 +1,7 @@
 import json
 import os
 import subprocess
-import sys
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -48,13 +48,13 @@ def json_safe(obj):
 class SEKAI_Real_Walking_Dataset(Dataset):
     def __init__(
         self,
-        csv_path="sekai-real-walking.csv",
+        csv_path="data/sekai-real-walking.csv",
         features_path="./data/clips",
         feature_framerate=1.0,
         max_frames=100,
         image_resolution=224,
         pipeline_max_saved_frames=24,
-        save_frames=False,
+        save_frames=True,
         yamnet_hop=0.48,
         refresh_metadata=False
     ):
@@ -64,7 +64,7 @@ class SEKAI_Real_Walking_Dataset(Dataset):
         self.features_path = os.path.abspath(str(features_path))
         self.sample_len = len([f for f in os.listdir(self.features_path) if f.endswith('.mp4')])
 
-        self.metadata_cache_dir = "./data/sekai-real-walking.sekai_cache"
+        self.metadata_cache_dir = "./data/cache"
         os.makedirs(self.metadata_cache_dir, exist_ok=True)
 
         self.pipeline_max_saved_frames = pipeline_max_saved_frames
@@ -80,9 +80,13 @@ class SEKAI_Real_Walking_Dataset(Dataset):
         )
 
         self.yamnet_hop = yamnet_hop
-        self.yamnet_model_path, self.yamnet_class_names_path, self.yamnet_params_path =  os.path.abspath(os.path.join(self.features_path, "yamnet/yamnet.h5")), os.path.abspath(os.path.join(self.features_path, "yamnet/yamnet_class_map.csv")), os.path.abspath(os.path.join(self.features_path, "yamnet/yamnet.h5"))
+        _pkg_yamnet = Path(__file__).resolve().parent / "yamnet"
+        self.yamnet_class_names_path = str(_pkg_yamnet / "yamnet_class_map.csv")
+        self.yamnet_model_path = _pkg_yamnet / "yamnet.h5"
+
         self.yamnet_class_names = yamnet_model.class_names(self.yamnet_class_names_path)
-        self.yamnet_model = yamnet_model.yamnet_frames_model(self.yamnet_params_path)
+        yamnet_p = replace(yamnet_params.Params(), patch_hop_seconds=self.yamnet_hop)
+        self.yamnet_model = yamnet_model.yamnet_frames_model(yamnet_p)
         self.yamnet_model.load_weights(self.yamnet_model_path)
 
     def __len__(self):
@@ -99,8 +103,8 @@ class SEKAI_Real_Walking_Dataset(Dataset):
 
         text = meta["combined_text"]
 
-        lat = float(meta.get("latitude"))
-        lon = float(meta.get("longitude"))
+        lat = np.float32(float(meta.get("latitude")))
+        lon = np.float32(float(meta.get("longitude")))
 
         return text, video, video_mask, lat, lon
 
@@ -121,7 +125,7 @@ class SEKAI_Real_Walking_Dataset(Dataset):
         if os.path.isfile(meta_path) and not self.refresh_metadata:
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-                video, video_mask = self._load_video(video_path, save_frames=False, frames_dir=None)
+                video, video_mask, _ = self._load_video(video_path, save_frames=False, frames_dir=None)
                 return meta, video, video_mask
 
         csv_row = json_safe(row.where(pd.notnull(row), None).to_dict())
@@ -152,7 +156,7 @@ class SEKAI_Real_Walking_Dataset(Dataset):
         video_mask = np.zeros((1, self.max_frames), dtype=np.int64)
         video = np.zeros(
             (1, self.max_frames, 1, 3, self.rawVideoExtractor.size, self.rawVideoExtractor.size),
-            dtype=np.float,
+            dtype=np.float32,
         ) # [1, T, 1, 3, H, W]
         frame_paths: list[str] = []
 
@@ -191,7 +195,7 @@ class SEKAI_Real_Walking_Dataset(Dataset):
                 out_sub = Path(frames_dir) / stem
                 out_sub.mkdir(parents=True, exist_ok=True)
                 for i in range(n):
-                    bgr = self._clip_normalized_chw_to_bgr_uint8(vid_np[i])
+                    bgr = self._clip_unnormalized(vid_np[i])
                     fp = out_sub / f"{stem}_{i:05d}.png"
                     cv2.imwrite(str(fp), bgr)
                     frame_paths.append(str(fp.resolve()))
@@ -208,11 +212,12 @@ class SEKAI_Real_Walking_Dataset(Dataset):
         wav_data, _sr = sf.read(wav_path, dtype=np.int16)
         waveform = (wav_data / 32768.0).astype(np.float32)
         scores, _emb, _spec = self.yamnet_model(waveform)
-        scores = scores.numpy()
-        top_idx = np.argsort(scores)[::-1][:3]
+        scores_np = scores.numpy()
+        pooled = scores_np.mean(axis=0) if scores_np.ndim > 1 else scores_np.reshape(-1)
+        top_idx = np.argsort(pooled)[::-1][:3]
         ranked, names = [], []
         for i in top_idx:
-            ranked.append({"class": self.yamnet_class_names[i], "score": float(scores[i])})
+            ranked.append({"class": self.yamnet_class_names[i], "score": float(pooled[i])})
             names.append(self.yamnet_class_names[i])
         return ranked, names
 

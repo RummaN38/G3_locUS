@@ -5,3 +5,4 @@ g3.pth
 data/*
 sekai-real-walking.csv
 G3_v2/videos/*
+*.pyc

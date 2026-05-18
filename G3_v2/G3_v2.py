@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 from transformers import CLIPTokenizer, CLIPImageProcessor, CLIPModel
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from pyproj import Proj, Transformer
 
-from .rff.layers import GaussianEncoding
+from rff.layers import GaussianEncoding
 
 class LocationEncoderCapsule(nn.Module):
     def __init__(self, sigma):
@@ -42,16 +43,17 @@ class CustomLocationEncoder(nn.Module):
         self.transformer = Transformer.from_proj(proj_wgs84, proj_mercator, always_xy=True)
 
     def forward(self, input):
+        device = input.device
         lat = input[:, 0].float().detach().cpu().numpy()
         lon = input[:, 1].float().detach().cpu().numpy()
         projected_lon_lat = self.transformer.transform(lon, lat)
         location = []
         for coord in zip(*projected_lon_lat):
             location.append([coord[1],coord[0]])
-        location = torch.Tensor(location).to('cuda')
+        location = torch.tensor(location, dtype=torch.float32, device=device)
         location = location / 20037508.3427892
 
-        location_features = torch.zeros(location.shape[0], 512).to('cuda')
+        location_features = torch.zeros(location.shape[0], 512, device=device, dtype=torch.float32)
 
         for i in range(self.n):
             location_features += self._modules['LocEnc' + str(i)](location)
@@ -93,6 +95,10 @@ class G3(torch.nn.Module):
             num_layers=1,
         )
 
+        # 3×3×3 box filter, average per RGB channel
+        _k = torch.full((3, 1, 3, 3, 3), 1.0 / 27.0)
+        self.register_buffer("temporal_smooth_kernel", _k)
+
         # _CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
         # _CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
@@ -114,6 +120,14 @@ class G3(torch.nn.Module):
         # std = self._clip_norm_std.to(dtype=x.dtype, device=x.device)
         # video = (x - mean) / std
 
+        if video.dim() == 7:
+            video = video.squeeze(1).squeeze(2)
+        elif video.dim() == 6 and video.shape[2] == 1:
+            video = video.squeeze(2)
+        
+        if video_mask.dim() == 3:
+            video_mask = video_mask.squeeze(1)
+
         if video.dim() == 4:
             video = video.unsqueeze(1)
         if video.dim() != 5:
@@ -127,8 +141,17 @@ class G3(torch.nn.Module):
             if video_mask.shape != (b, t):
                 raise ValueError(f"video_mask must be [B, T] = [{b}, {t}]")
 
+        # 3d conv with spatial and temporal smoothing
+        orig_dtype = video.dtype
+        x3d = video.float().permute(0, 2, 1, 3, 4).contiguous()  # [B, 3, T, H, W]
+        k_smooth = self.temporal_smooth_kernel.to(device=x3d.device, dtype=x3d.dtype)
+        x3d = F.pad(x3d, (1, 1, 1, 1, 1, 1), mode="replicate")
+        x3d = F.conv3d(x3d, k_smooth, bias=None, stride=1, padding=(0, 0, 0), groups=3)
+        video = x3d.permute(0, 2, 1, 3, 4).to(dtype=orig_dtype)
+
         flat = video.reshape(b * t, c, h, w) # [B * T, 3, H, W]
-        pooler_flat = self.vision_model(pixel_values=flat) # [B * T, 768]
+        vision_out = self.vision_model(pixel_values=flat)
+        pooler_flat = vision_out.pooler_output # [B * T, 768]
         vision_seq = pooler_flat.reshape(b, t, -1) # [B, T, 768]
         frame_embeds = self.vision_projection(pooler_flat).reshape(b, t, -1) # [B, T, 768]
 

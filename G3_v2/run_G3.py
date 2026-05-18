@@ -4,8 +4,8 @@ from torch.utils.data import DataLoader
 from accelerate import Accelerator, DistributedDataParallelKwargs
 import warnings
 
-from .G3_v2 import G3
-from .sekai_dataset import SEKAI_Real_Walking_Dataset
+from G3_v2 import G3
+from sekai_dataset import SEKAI_Real_Walking_Dataset
 
 
 warnings.filterwarnings('ignore')
@@ -14,15 +14,16 @@ warnings.filterwarnings('ignore')
 def train_1epoch(dataloader, eval_dataloader, earlystopper, model, vision_processor, text_processor, optimizer, scheduler, device, accelerator=None):
     model.train()
     t = tqdm(dataloader, disable=not accelerator.is_local_main_process)
-    for i, (images, texts, longitude, latitude) in enumerate(t):
+    for i, (texts, images, video_mask, latitude, longitude) in enumerate(t):
         texts = text_processor(text=texts, padding='max_length', truncation=True, return_tensors='pt', max_length=77)
         images = images.to(device)
         texts = texts.to(device)
+        video_mask = video_mask.to(device)
         longitude = longitude.to(device).float()
         latitude = latitude.to(device).float()
         optimizer.zero_grad()
 
-        output = model(images, texts, longitude, latitude, return_loss=True)
+        output = model(images, texts, longitude, latitude, video_mask=video_mask, return_loss=True)
         loss = output['loss']
 
         # loss.backward()
@@ -43,14 +44,12 @@ def main():
     location_encoder_dict = torch.load('location_encoder.pth') # from geoclip
     model.location_encoder.load_state_dict(location_encoder_dict)
 
-    dataset = SEKAI_Real_Walking_Dataset() # !!!
+    dataset = SEKAI_Real_Walking_Dataset()
     dataloader = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=16, pin_memory=True, prefetch_factor=5)
 
-    params = []
     for name, param in model.named_parameters():
         if param.requires_grad:
             print(name, param.size())
-            params.append(param)
 
     optimizer = torch.optim.AdamW([param for name,param in model.named_parameters() if param.requires_grad], lr=3e-5, weight_decay=1e-6)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.87)
@@ -58,10 +57,11 @@ def main():
     model, optimizer, dataloader, scheduler = accelerator.prepare(
         model, optimizer, dataloader, scheduler
     )
+    device = accelerator.device
 
     eval_dataloader = None
     earlystopper = None
-    for epoch in range(10):
+    for epoch in tqdm(range(10)):
         train_1epoch(dataloader, eval_dataloader, earlystopper, model, model.vision_processor, model.text_processor, optimizer, scheduler, device, accelerator)
         unwrapped_model = accelerator.unwrap_model(model)
         torch.save(unwrapped_model, 'checkpoints/g3_{}.pth'.format(epoch))

@@ -7,6 +7,11 @@ from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normal
 import cv2
 
 
+class _PILToRGB:
+    def __call__(self, image):
+        return image.convert("RGB")
+
+
 class RawVideoExtractorCV2():
     def __init__(self, centercrop=False, size=224, framerate=-1):
         self.centercrop = centercrop
@@ -18,7 +23,7 @@ class RawVideoExtractorCV2():
         return Compose([
             Resize(n_px, interpolation=Image.BICUBIC),
             CenterCrop(n_px),
-            lambda image: image.convert("RGB"),
+            _PILToRGB(),
             ToTensor(),
             Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
         ])
@@ -28,6 +33,8 @@ class RawVideoExtractorCV2():
             assert isinstance(start_time, int) and isinstance(end_time, int) \
                    and start_time > -1 and end_time > start_time
         assert sample_fp > -1
+        if sample_fp > 0:
+            sample_fp = int(sample_fp)
 
         # Samples a frame sample_fp X frames.
         cap = cv2.VideoCapture(video_file)
