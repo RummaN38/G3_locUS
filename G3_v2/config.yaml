@@ -1,0 +1,20 @@
+data:
+  csv_path: data/sekai-real-walking.csv
+  features_path: ./data/clips
+  max_frames: 10 # Update if more computational resources are available
+  image_resolution: 224
+  feature_framerate: 1.0
+  yamnet_hop: 0.48
+  save_frames: true
+  refresh_metadata: false
+
+train:
+  batch_size: 2 # Update if more computational resources are available
+  num_workers: 0 # Update if more computational resources are available
+  prefetch_factor: 5
+  pin_memory: true
+  epochs: 10 # Update if more computational resources are available
+  learning_rate: 3.0e-5
+  weight_decay: 1.0e-6
+  scheduler_step_size: 1
+  scheduler_gamma: 0.87

@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -16,8 +17,10 @@ from yamnet import yamnet as yamnet_model, params as yamnet_params
 
 
 def extract_audio_from_video(video_path: str, out_wav: str) -> None:
+    found = shutil.which("ffmpeg")
+
     cmd = [
-        "ffmpeg", # change this to the path of the ffmpeg binary
+        found,
         "-y",
         "-i",
         video_path,
@@ -28,7 +31,10 @@ def extract_audio_from_video(video_path: str, out_wav: str) -> None:
         "-vn",
         out_wav,
     ]
-    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not os.path.isfile(video_path):
+        raise FileNotFoundError(f"Video not found: {video_path}")
+
+    r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(
             "ffmpeg failed extracting audio. Install ffmpeg and ensure the video has an audio track."
@@ -62,7 +68,8 @@ class SEKAI_Real_Walking_Dataset(Dataset):
         self.csv = pd.read_csv(csv_path)
 
         self.features_path = os.path.abspath(str(features_path))
-        self.sample_len = len([f for f in os.listdir(self.features_path) if f.endswith('.mp4')])
+
+        self.sample_len = len(self.csv)
 
         self.metadata_cache_dir = "./data/cache"
         os.makedirs(self.metadata_cache_dir, exist_ok=True)
